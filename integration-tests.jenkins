@@ -1,0 +1,94 @@
+pipeline {
+    agent any
+    //agent { dockerfile true }
+    options {
+        timestamps()
+        timeout(time: 2, unit: 'HOURS')
+        buildDiscarder(logRotator(daysToKeepStr:'10'))
+        disableConcurrentBuilds()
+    }
+    environment {
+        SAUCE_USERNAME = "gladly"
+        SAUCE_ACCESS_KEY = credentials('sauce-access-key')
+        SAUCE_TUNNEL_ID = "${env.BUILD_NUMBER}"
+        INTEGRATION_TWILIO_ACCOUNTSID = credentials('integration-twilio-accountsid')
+        INTEGRATION_TWILIO_AUTHTOKEN = credentials('integration-twilio-authtoken')
+        SENDGRID_API_KEY = credentials('sendgrid-api-key')
+        MASHAPE_API_KEY = credentials('mashape-api-key')
+        TWILIO_AUTH_TOKEN = credentials('twilio-auth-token-automation')
+        TWILIO_ORG_ACCOUNT_SID = credentials('twilio-org-account-sid-automation')
+        TWILIO_ORG_AUTH_TOKEN = credentials('twilio-org-auth-token-automation')
+        JOB_USER = getJobUsername()
+    }
+
+    parameters {
+        string(defaultValue: 'end_to_end_all_browsers', description: 'Test suite', name: 'testSuite')
+        string(defaultValue: 'si-master', description: 'Organization to test ("si-master", "si-staging" etc.)', name: 'testOrg')
+        string(defaultValue: '', description: 'Service ("sauce" for SauceLabs)', name: 'testService')
+        string(defaultValue: 'chrome', description: 'Browser ("ie11" or "chrome")', name: 'testBrowser')
+        string(defaultValue: '1', description: 'Maximum number of parallel tests', name: 'testMaxInstances')
+        string(defaultValue: '1', description: 'Maximum number of parallel chrome browsers', name: 'testChromeMaxInstances')
+        booleanParam(defaultValue: false, description: 'Run with multiple browsers', name: 'testMultibrowser')
+        string(defaultValue: 'e2e-test-notification', description: 'Slack channel to notify', name: 'slackChannel')
+    }
+
+    stages {
+        stage('Set description') {
+            steps {
+                script {
+                    currentBuild.description = "${params.testOrg}: ${params.testSuite} on ${params.testBrowser}"
+                }
+            }
+        }
+        stage('Run tests') {
+            agent {
+                docker {
+                    image 'sagan/selenium:3.10.0-argon'
+                    args '-v /dev/shm:/dev/shm -u root --ulimit nofile=8000:8000' // otherwise Chrome crashes running out of memory, or SauceLabs complains
+                    registryUrl 'https://registry.hub.docker.com'
+                    registryCredentialsId 'dockerHub'
+                }
+            }
+
+            environment {
+                TEST_SUITE = "${params.testSuite}"
+                ORG = "${params.testOrg}"
+                BROWSER = "${params.testBrowser}"
+                SERVICE = "${params.testService}"
+                MAX_INSTANCES = "${params.testMaxInstances}"
+                CHROME_MAX_INSTANCES = "${params.testChromeMaxInstances}"
+                MULTIBROWSER = "${params.testMultibrowser}"
+            }
+
+            steps {
+                // clone build-harness
+                checkout([$class: 'GitSCM', branches: [[name: 'origin/master']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'build-harness']], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'github', url: 'https://github.com/sagansystems/build-harness.git']]])
+                // workaround for https://issues.jenkins-ci.org/browse/JENKINS-41316
+                sh '''
+                nohup /opt/bin/entry_point.sh &
+                sleep 10
+                '''
+                sshagent(['saganbotSSH']) { // need SSH to fetch private deps
+                    sh 'make -C integration deps'
+                }
+                // run tests
+                sh 'make -C integration test-suite'
+                // save results
+                stash name: 'allure-results', includes: 'integration/allure-results/*' 
+            }
+            post {
+                always {
+                    archiveArtifacts allowEmptyArchive: true, artifacts: 'integration/logs/*.*'
+                    archiveArtifacts allowEmptyArchive: true, artifacts: 'integration/shots/*.*'
+                    junit 'integration/logs/*.xml'
+                }
+            }
+        }
+    }
+    post {
+        always{
+            unstash 'allure-results' //unpack test results
+            allure results: [[path: 'integration/allure-results/*']] //build allure report    
+        }
+    }  
+}
